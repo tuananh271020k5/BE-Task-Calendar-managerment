@@ -81,7 +81,6 @@ const notificationSchema = new Schema<NotificationDoc>(
     snoozedUntil: {
       type: Date,
       default: null,
-      index: true,
     },
     isGroup: {
       type: Boolean,

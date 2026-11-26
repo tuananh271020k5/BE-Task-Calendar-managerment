@@ -1,5 +1,8 @@
 import { Queue, Job } from "bullmq";
-import { getRedisConfig } from "../../services/redis.service";
+import { Types } from "mongoose";
+import { getRedisConfig, supportsBullMQ } from "../../services/redis.service";
+import { emailService } from "./email.service";
+import { notificationRepository } from "./notification.repository";
 
 export interface NotificationJobData {
   userId: string;
@@ -30,30 +33,60 @@ export interface InviteEmailJobData {
   organizerEmail?: string;
 }
 
-const redisConfig = getRedisConfig();
-
-export const notificationQueue = new Queue<
+type NotificationQueueType = Queue<
   NotificationJobData | EmailJobData | InviteEmailJobData
->("notification", {
-  connection: redisConfig,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: {
-      type: "exponential",
-      delay: 1000,
+>;
+
+let notificationQueueInstance: NotificationQueueType | null = null;
+let warnedUnsupported = false;
+
+const getNotificationQueue = async (): Promise<NotificationQueueType | null> => {
+  if (notificationQueueInstance) {
+    return notificationQueueInstance;
+  }
+
+  const { supported, version } = await supportsBullMQ();
+  if (!supported) {
+    if (!warnedUnsupported) {
+      warnedUnsupported = true;
+      console.warn(
+        `[NotificationQueue] Redis ${version ?? "unknown"} < 5.0.0 — BullMQ disabled, using direct delivery fallback.`,
+      );
+    }
+    return null;
+  }
+
+  const queue: NotificationQueueType = new Queue("notification", {
+    connection: getRedisConfig(),
+    defaultJobOptions: {
+      attempts: 3,
+      backoff: {
+        type: "exponential",
+        delay: 1000,
+      },
+      removeOnComplete: 100,
+      removeOnFail: 50,
     },
-    removeOnComplete: 100,
-    removeOnFail: 50,
-  },
-});
+  });
+
+  queue.on("error", (err) => {
+    console.error("[NotificationQueue] Queue error:", err.message);
+  });
+
+  notificationQueueInstance = queue;
+  return queue;
+};
 
 export const notificationQueueService = {
   // Add notification job to queue
   add: async (
     data: NotificationJobData,
     options?: { delay?: number; priority?: number },
-  ): Promise<Job> => {
-    return notificationQueue.add("send-notification", data, {
+  ): Promise<Job | null> => {
+    const queue = await getNotificationQueue();
+    if (!queue) return null;
+
+    return queue.add("send-notification", data, {
       ...options,
       jobId: `${data.userId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
     });
@@ -66,8 +99,25 @@ export const notificationQueueService = {
     subject: string;
     html: string;
     notificationId: string;
-  }): Promise<Job> => {
-    return notificationQueue.add("send-email", data, {
+  }): Promise<Job | null> => {
+    const queue = await getNotificationQueue();
+    if (!queue) {
+      const result = await emailService.send({
+        to: data.email,
+        subject: data.subject,
+        html: data.html,
+      });
+      if (
+        result.success &&
+        data.notificationId &&
+        Types.ObjectId.isValid(data.notificationId)
+      ) {
+        await notificationRepository.markEmailSent(data.notificationId);
+      }
+      return null;
+    }
+
+    return queue.add("send-email", data, {
       priority: 2,
       attempts: 5,
       backoff: {
@@ -78,8 +128,18 @@ export const notificationQueueService = {
   },
 
   // Add invite email job (no notificationId required)
-  addInviteEmail: async (data: InviteEmailJobData): Promise<Job> => {
-    return notificationQueue.add("send-invite-email", data, {
+  addInviteEmail: async (data: InviteEmailJobData): Promise<Job | null> => {
+    const queue = await getNotificationQueue();
+    if (!queue) {
+      await emailService.send({
+        to: data.to,
+        subject: data.subject,
+        html: data.html,
+      });
+      return null;
+    }
+
+    return queue.add("send-invite-email", data, {
       priority: 3,
       attempts: 5,
       backoff: {
@@ -91,11 +151,16 @@ export const notificationQueueService = {
 
   // Get queue status
   getStatus: async () => {
+    const queue = await getNotificationQueue();
+    if (!queue) {
+      return { waiting: 0, active: 0, completed: 0, failed: 0 };
+    }
+
     const [waiting, active, completed, failed] = await Promise.all([
-      notificationQueue.getWaitingCount(),
-      notificationQueue.getActiveCount(),
-      notificationQueue.getCompletedCount(),
-      notificationQueue.getFailedCount(),
+      queue.getWaitingCount(),
+      queue.getActiveCount(),
+      queue.getCompletedCount(),
+      queue.getFailedCount(),
     ]);
 
     return { waiting, active, completed, failed };
@@ -103,12 +168,18 @@ export const notificationQueueService = {
 
   // Clean old jobs
   clean: async (gracePeriodMs: number = 24 * 60 * 60 * 1000) => {
-    await notificationQueue.clean(gracePeriodMs, 100, "completed");
-    await notificationQueue.clean(gracePeriodMs, 100, "failed");
+    const queue = await getNotificationQueue();
+    if (!queue) return;
+
+    await queue.clean(gracePeriodMs, 100, "completed");
+    await queue.clean(gracePeriodMs, 100, "failed");
   },
 
   // Get failed jobs for retry
   getFailedJobs: async (limit: number = 50) => {
-    return notificationQueue.getFailed(limit);
+    const queue = await getNotificationQueue();
+    if (!queue) return [];
+
+    return queue.getFailed(limit);
   },
 };

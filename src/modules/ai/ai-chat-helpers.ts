@@ -46,6 +46,7 @@ export type ChatInput = {
   message: string;
   conversationId?: string;
   parentTaskId?: string;
+  currentPage?: string;
   systemPrompt?: string;
   subtaskContext?: SubtaskContextInput;
   fewShotMessages?: { role: "user" | "assistant"; content: string }[];
@@ -59,6 +60,7 @@ export type ChatInput = {
 export const normalizeForIntent = (text: string): string =>
   text
     .toLowerCase()
+    .replace(/đ/g, "d")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
 

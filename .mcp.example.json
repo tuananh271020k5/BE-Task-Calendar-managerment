@@ -1,0 +1,41 @@
+{
+  "mcpServers": {
+    "taskmind-http": {
+      "type": "http",
+      "url": "http://localhost:3002/mcp",
+      "headers": {
+        "Authorization": "Bearer <YOUR_TASKMIND_JWT>"
+      }
+    },
+    "taskmind-stdio": {
+      "command": "npx",
+      "args": [
+        "ts-node",
+        "-P",
+        "tsconfig.json",
+        "--transpile-only",
+        "src/modules/ai/mcp/stdio.ts"
+      ],
+      "env": {
+        "TASKMIND_MCP_USER_ID": "<YOUR_MONGO_USER_OBJECT_ID>"
+      }
+    },
+    "mongodb-dev": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mongodb-mcp-server@latest"
+      ],
+      "env": {
+        "MDB_MCP_CONNECTION_STRING": "<YOUR_MONGODB_URI>"
+      }
+    },
+    "playwright-dev": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest"
+      ]
+    }
+  }
+}

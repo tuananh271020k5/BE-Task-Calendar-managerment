@@ -20,11 +20,14 @@ import {
   toPublicMessage,
 } from "./ai.mapper";
 import {
-  detectIntent,
   detectUserLanguage,
   resolveTargetLanguage,
   buildSystemPrompt,
 } from "./ai-intent";
+import { routeChatMessage } from "./agents/agent-router";
+import { guideAgent } from "./agents/guide.agent";
+import { aiGuardrailService } from "./agents/ai-guardrails.service";
+import { aiUsageService } from "./ai-usage.service";
 import {
   buildDiscussedSubtasks,
   computePendingSlots,
@@ -33,7 +36,6 @@ import {
 } from "./ai-context";
 import { userMemoryService } from "./user-memory.service";
 import {
-  logScheduleDebug,
   shortUser,
   isCommitConfirmationMessage,
   ensureAssistantContent,
@@ -47,7 +49,8 @@ import { aiCalendarContextService } from "./ai-calendar-context.service";
 export const aiChatService = {
   /**
    * Main non-streaming chat endpoint.
-   * Detects intent → builds prompt → delegates to calendar handler or plain LLM.
+   * Routes via Hybrid Router → 0-token greeting, Guide Agent (BM25 + cache),
+   * Calendar Agent, or Tutor/General LLM without stuffing unused context.
    */
   chat: async (
     userId: string,
@@ -57,6 +60,8 @@ export const aiChatService = {
     conversationId: string;
     model?: string;
     tasksCreated?: number;
+    cached?: boolean;
+    route?: string;
     usage?: {
       promptTokens?: number;
       completionTokens?: number;
@@ -66,12 +71,54 @@ export const aiChatService = {
     if (!Types.ObjectId.isValid(userId)) {
       throw new Error("USER_ID_INVALID");
     }
+    const startedAt = Date.now();
     const userObjectId = new Types.ObjectId(userId);
 
     const { id: conversationObjectId, lastSubtaskKey } =
       await resolveConversation(userObjectId, input);
 
-    // ── Load conversation history ────────────────────────────────────
+    // ── Input Guardrail (length & prompt injection) ──────────────────
+    const inputCheck = aiGuardrailService.checkInputGuardrail(input.message);
+    if (!inputCheck.allowed) {
+      await aiRepository.createMessage({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+        role: "user",
+        content: input.message.slice(0, 6000),
+      });
+      await aiRepository.createMessage({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+        role: "assistant",
+        content: inputCheck.safeReply,
+        tokens: 0,
+      });
+      await aiRepository.touchConversationUpdatedAt({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+      });
+      await aiUsageService.recordUsage({
+        userId,
+        conversationId: String(conversationObjectId),
+        feature: "chat",
+        route: "GUARDRAIL_BLOCKED",
+        model: "guardrail:input",
+        provider: "guardrail",
+        cacheHit: false,
+        guardrailTriggered: inputCheck.reason,
+        latencyMs: Date.now() - startedAt,
+        status: "blocked",
+      });
+      return {
+        reply: inputCheck.safeReply,
+        conversationId: String(conversationObjectId),
+        model: "guardrail:input",
+        route: "GUARDRAIL_BLOCKED",
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      };
+    }
+
+    // ── Load conversation history once ───────────────────────────────
     const historyMessages = await aiRepository.listMessagesByConversation({
       conversationId: conversationObjectId,
       userId: userObjectId,
@@ -116,90 +163,40 @@ export const aiChatService = {
         : undefined,
     });
 
-    // ── Intent detection + override for pending draft ────────────────
-    let intent = detectIntent(input.message);
-    const userLang = detectUserLanguage(input.message);
-    const targetLang = resolveTargetLanguage(input.subtaskContext);
-
-    if (
-      intent !== "CALENDAR_QUERY" &&
-      isCommitConfirmationMessage(input.message)
-    ) {
+    // ── Check pending draft only when message looks like confirmation ─
+    let hasPendingDraft = false;
+    if (isCommitConfirmationMessage(input.message)) {
       try {
         const convDoc = await aiRepository.findConversationByIdForUser({
           conversationId: conversationObjectId,
           userId: userObjectId,
         });
         const pendingDraft = (convDoc as any)?.context?.proposalDraft;
-        const hasPendingDraft =
+        hasPendingDraft =
           !!pendingDraft &&
           (Array.isArray(pendingDraft.items)
             ? pendingDraft.items.length > 0
             : Array.isArray(pendingDraft.sessions) &&
               pendingDraft.sessions.length > 0);
-        if (hasPendingDraft) {
-          logScheduleDebug("chat.intent.override_to_calendar", {
-            user: shortUser(userId),
-            conversationId: String(conversationObjectId),
-            originalIntent: intent,
-            reason: "commit_confirmation_with_pending_draft",
-          });
-          intent = "CALENDAR_QUERY";
-        }
-      } catch (err) {
-        logScheduleDebug("chat.intent.override_check_error", {
-          user: shortUser(userId),
-          message: err instanceof Error ? err.message : String(err),
-        });
+      } catch {
+        hasPendingDraft = false;
       }
     }
 
-    // ── Build system prompt ──────────────────────────────────────────
-    const domain = detectDomainFromTask({
-      parentTaskTitle: input.subtaskContext?.parentTaskTitle,
-      parentTaskDescription: input.subtaskContext?.parentTaskDescription,
-      subtaskTitle: input.subtaskContext?.subtaskTitle,
-      subtaskDescription: input.subtaskContext?.description,
+    // ── Hybrid Router (0 token) ──────────────────────────────────────
+    const decision = routeChatMessage({
+      message: input.message,
+      currentPage: input.currentPage,
+      hasSubtaskContext: !!input.subtaskContext,
+      hasPendingDraft,
     });
 
-    const memories = await userMemoryService.loadRelevantMemories(
-      userObjectId,
-      domain,
-      20,
-    );
+    const userLang = detectUserLanguage(input.message);
+    const targetLang = resolveTargetLanguage(input.subtaskContext);
 
-    const freshHistory = await aiRepository.listMessagesByConversation({
-      conversationId: conversationObjectId,
-      userId: userObjectId,
-      limit: 40,
-    });
-
-    const discussedSubtasks = buildDiscussedSubtasks(freshHistory);
-    const pendingSlots = computePendingSlots({
-      domain,
-      memories,
-      history: freshHistory,
-    });
-
-    const calendarContext = await aiCalendarContextService
-      .getAIOrchestratorContext(userId)
-      .catch(() => "");
-
-    const systemContent = buildSystemPrompt({
-      userLang,
-      targetLang,
-      intent,
-      subtaskContext: input.subtaskContext,
-      customSystemPrompt: input.systemPrompt,
-      memoryHints: toMemoryHints(memories),
-      discussedSubtasks,
-      pendingSlots,
-      calendarContext,
-    });
-
-    // ── Prepare LLM messages ─────────────────────────────────────────
-    const HISTORY_TURN_CAP = 12;
-    const PER_MSG_CHAR_CAP = 1500;
+    // ── Prepare compact LLM history ──────────────────────────────────
+    const HISTORY_TURN_CAP = 8;
+    const PER_MSG_CHAR_CAP = 1000;
     const historyForAI = historyMessages
       .filter((m) => m.role === "user" || m.role === "assistant")
       .slice(-HISTORY_TURN_CAP)
@@ -212,63 +209,195 @@ export const aiChatService = {
             : m.content,
       }));
 
-    const fewShot =
-      historyForAI.length === 0 && input.fewShotMessages?.length
-        ? input.fewShotMessages.map((m) => ({
-            role: m.role as "user" | "assistant",
-            content: m.content,
-          }))
-        : [];
+    // ── Fast 0-token GREETING branch ─────────────────────────────────
+    if (decision.route === "GREETING" && decision.quickReply && !input.systemPrompt) {
+      await aiRepository.createMessage({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+        role: "assistant",
+        content: decision.quickReply,
+        tokens: 0,
+      });
+      await aiRepository.touchConversationUpdatedAt({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+      });
+      await aiUsageService.recordUsage({
+        userId,
+        conversationId: String(conversationObjectId),
+        feature: "chat",
+        route: decision.route,
+        model: "router:quick-reply",
+        provider: "router",
+        cacheHit: false,
+        latencyMs: Date.now() - startedAt,
+        status: "ok",
+      });
+      return {
+        reply: decision.quickReply,
+        conversationId: String(conversationObjectId),
+        model: "router:quick-reply",
+        route: decision.route,
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      };
+    }
 
-    const baseMessages: AiChatMessage[] = [
-      { role: "system", content: systemContent },
-      ...fewShot.map(
-        (m) => ({ role: m.role, content: m.content }) as AiChatMessage,
-      ),
-      ...historyForAI.map(
-        (m) => ({ role: m.role, content: m.content }) as AiChatMessage,
-      ),
-      { role: "user", content: input.message },
-    ];
-
-    // ── Dispatch to handler ──────────────────────────────────────────
-    let result: { content: string; model?: string; usage?: any } = {
+    // ── Dispatch to specialist agent or LLM ──────────────────────────
+    let result: {
+      content: string;
+      model?: string;
+      usage?: any;
+      cached?: boolean;
+      retrievalMode?: string;
+      kbChunksUsed?: number;
+      guardrailFlags?: string[];
+    } = {
       content: FALLBACK_ASSISTANT_REPLY,
       model: undefined,
       usage: undefined,
     };
     let tasksCreatedCount = 0;
 
-    if (intent === "CALENDAR_QUERY") {
-      const calResult = await handleCalendarIntent({
+    const domain = detectDomainFromTask({
+      parentTaskTitle: input.subtaskContext?.parentTaskTitle,
+      parentTaskDescription: input.subtaskContext?.parentTaskDescription,
+      subtaskTitle: input.subtaskContext?.subtaskTitle,
+      subtaskDescription: input.subtaskContext?.description,
+    });
+
+    try {
+      if (decision.route === "APP_GUIDE" && !input.systemPrompt) {
+        result = await guideAgent.run({
+          userId,
+          message: input.message,
+          userLang,
+          currentPage: input.currentPage,
+          kbModule: decision.kbModule,
+          historyForAI,
+          model: input.model,
+          maxTokens: input.maxTokens,
+        });
+      } else {
+        const quota = await aiGuardrailService.checkDailyQuota(userId);
+        if (!quota.allowed) {
+          throw new Error("AI_DAILY_QUOTA_EXCEEDED");
+        }
+
+        const shouldLoadMemories = !!(domain || input.subtaskContext);
+        const memories = shouldLoadMemories
+          ? await userMemoryService.loadRelevantMemories(userObjectId, domain, 12)
+          : [];
+
+        const discussedSubtasks = input.subtaskContext
+          ? buildDiscussedSubtasks(historyMessages)
+          : [];
+        const pendingSlots = shouldLoadMemories
+          ? computePendingSlots({
+              domain,
+              memories,
+              history: historyMessages,
+            })
+          : [];
+
+        // Only load 7-day calendar context for CALENDAR_TASK!
+        const calendarContext =
+          decision.route === "CALENDAR_TASK"
+            ? await aiCalendarContextService
+                .getAIOrchestratorContext(userId)
+                .catch(() => "")
+            : "";
+
+        const systemContent = buildSystemPrompt({
+          userLang,
+          targetLang,
+          intent: decision.subIntent,
+          subtaskContext: input.subtaskContext,
+          customSystemPrompt: input.systemPrompt,
+          memoryHints: toMemoryHints(memories),
+          discussedSubtasks,
+          pendingSlots,
+          calendarContext,
+        });
+
+        const fewShot =
+          historyForAI.length === 0 && input.fewShotMessages?.length
+            ? input.fewShotMessages.map((m) => ({
+                role: m.role as "user" | "assistant",
+                content: m.content,
+              }))
+            : [];
+
+        const baseMessages: AiChatMessage[] = [
+          { role: "system", content: systemContent },
+          ...fewShot.map(
+            (m) => ({ role: m.role, content: m.content }) as AiChatMessage,
+          ),
+          ...historyForAI.map(
+            (m) => ({ role: m.role, content: m.content }) as AiChatMessage,
+          ),
+          { role: "user", content: input.message },
+        ];
+
+        if (decision.route === "CALENDAR_TASK") {
+          const calResult = await handleCalendarIntent({
+            userId,
+            userObjectId,
+            conversationObjectId,
+            domain,
+            currentSubtaskKey,
+            input,
+            baseMessages,
+            historyForAILength: historyForAI.length,
+          });
+          result = {
+            content: calResult.content,
+            model: calResult.model,
+            usage: calResult.usage,
+          };
+          tasksCreatedCount = calResult.tasksCreatedCount;
+        } else {
+          result = await aiProvider.chat({
+            purpose: "chat",
+            messages: baseMessages,
+            model: input.model,
+            temperature:
+              decision.subIntent === "EXERCISE" ||
+              decision.subIntent === "CHECK_ANSWER"
+                ? 0.2
+                : 0.4,
+            maxTokens: input.maxTokens,
+          });
+        }
+      }
+    } catch (err) {
+      const errCode = err instanceof Error ? err.message : "UNKNOWN";
+      const isQuotaBlocked = errCode === "AI_DAILY_QUOTA_EXCEEDED";
+      await aiUsageService.recordUsage({
         userId,
-        userObjectId,
-        conversationObjectId,
-        domain,
-        currentSubtaskKey,
-        input,
-        baseMessages,
-        historyForAILength: historyForAI.length,
+        conversationId: String(conversationObjectId),
+        feature: "chat",
+        route: decision.route,
+        model: result.model,
+        latencyMs: Date.now() - startedAt,
+        status: isQuotaBlocked ? "blocked" : "error",
+        guardrailTriggered: isQuotaBlocked ? "QUOTA_EXCEEDED" : undefined,
+        errorCode: isQuotaBlocked ? undefined : errCode,
+        meta: { subIntent: decision.subIntent },
       });
-      result = {
-        content: calResult.content,
-        model: calResult.model,
-        usage: calResult.usage,
-      };
-      tasksCreatedCount = calResult.tasksCreatedCount;
-    } else {
-      result = await aiProvider.chat({
-        purpose: "chat",
-        messages: baseMessages,
-        model: input.model,
-        temperature:
-          intent === "EXERCISE" || intent === "CHECK_ANSWER" ? 0.2 : 0.4,
-        maxTokens: input.maxTokens,
-      });
+      throw err;
     }
 
-    // ── Persist assistant reply ──────────────────────────────────────
-    const finalAssistantContent = ensureAssistantContent(result.content);
+    // ── Output Guardrail + Persist assistant reply ───────────────────
+    const rawAssistantContent = ensureAssistantContent(result.content);
+    const sanitizedOutput = aiGuardrailService.validateAndSanitizeOutput(
+      rawAssistantContent,
+      { validateInternalRoutes: decision.route === "APP_GUIDE" },
+    );
+    const finalAssistantContent = ensureAssistantContent(sanitizedOutput.content);
+    const guardrailFlags = Array.from(
+      new Set([...(result.guardrailFlags ?? []), ...sanitizedOutput.flags]),
+    );
+
     await aiRepository.createMessage({
       conversationId: conversationObjectId,
       userId: userObjectId,
@@ -297,19 +426,46 @@ export const aiChatService = {
       domain,
     });
 
-    void userMemoryService.ingestUtterance(userObjectId, input.message);
+    if (decision.route !== "APP_GUIDE") {
+      void userMemoryService.ingestUtterance(userObjectId, input.message);
+    }
+
+    await aiUsageService.recordUsage({
+      userId,
+      conversationId: String(conversationObjectId),
+      feature: "chat",
+      route: decision.route,
+      model: result.model,
+      promptTokens: result.usage?.promptTokens,
+      completionTokens: result.usage?.completionTokens,
+      totalTokens: result.usage?.totalTokens,
+      latencyMs: Date.now() - startedAt,
+      cacheHit: !!result.cached,
+      guardrailTriggered: guardrailFlags.length
+        ? guardrailFlags.join(",")
+        : undefined,
+      status: "ok",
+      meta: {
+        subIntent: decision.subIntent,
+        retrievalMode: result.retrievalMode,
+        kbChunksUsed: result.kbChunksUsed,
+        tasksCreatedCount,
+      },
+    });
 
     return {
       reply: finalAssistantContent,
       conversationId: String(conversationObjectId),
       model: result.model,
+      route: decision.route,
+      ...(result.cached ? { cached: true } : {}),
       usage: result.usage,
       ...(tasksCreatedCount > 0 ? { tasksCreated: tasksCreatedCount } : {}),
     };
   },
 
   /**
-   * Streaming chat endpoint (simplified — no tool calling).
+   * Streaming chat endpoint (with recent conversation history when conversationId exists).
    */
   chatStream: async function* (
     userId: string,
@@ -324,8 +480,37 @@ export const aiChatService = {
     if (!Types.ObjectId.isValid(userId)) {
       throw new Error("USER_ID_INVALID");
     }
+    const startedAt = Date.now();
     const userObjectId = new Types.ObjectId(userId);
     const title = input.message.slice(0, 60);
+
+    const inputCheck = aiGuardrailService.checkInputGuardrail(input.message);
+    if (!inputCheck.allowed && inputCheck.reason === "INPUT_TOO_LONG") {
+      await aiUsageService.recordUsage({
+        userId,
+        feature: "chat_stream",
+        route: "GUARDRAIL_BLOCKED",
+        model: "guardrail:input",
+        provider: "guardrail",
+        guardrailTriggered: "INPUT_TOO_LONG",
+        latencyMs: Date.now() - startedAt,
+        status: "blocked",
+      });
+      throw new Error("INPUT_TOO_LONG");
+    }
+
+    const quota = await aiGuardrailService.checkDailyQuota(userId);
+    if (!quota.allowed && inputCheck.allowed) {
+      await aiUsageService.recordUsage({
+        userId,
+        feature: "chat_stream",
+        route: "GENERAL_CHAT",
+        guardrailTriggered: "QUOTA_EXCEEDED",
+        latencyMs: Date.now() - startedAt,
+        status: "blocked",
+      });
+      throw new Error("AI_DAILY_QUOTA_EXCEEDED");
+    }
 
     if (input.conversationId && !Types.ObjectId.isValid(input.conversationId)) {
       throw new Error("CONVERSATION_ID_INVALID");
@@ -339,6 +524,7 @@ export const aiChatService = {
           })
         )._id;
 
+    let streamHistory: AiChatMessage[] = [];
     if (input.conversationId) {
       const existing = await aiRepository.findConversationByIdForUser({
         conversationId: conversationObjectId,
@@ -347,6 +533,24 @@ export const aiChatService = {
       if (!existing) {
         throw new Error("CONVERSATION_FORBIDDEN");
       }
+      const recent = await aiRepository.listMessagesByConversation({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+        limit: 12,
+      });
+      streamHistory = recent
+        .filter((m) => m.role === "user" || m.role === "assistant")
+        .slice(-6)
+        .map((m) => ({
+          role:
+            m.role === "assistant"
+              ? ("assistant" as const)
+              : ("user" as const),
+          content:
+            m.content.length > 1000
+              ? `${m.content.slice(0, 1000)}…`
+              : m.content,
+        }));
     }
 
     await aiRepository.createMessage({
@@ -358,14 +562,47 @@ export const aiChatService = {
 
     yield { type: "meta", conversationId: String(conversationObjectId) };
 
+    if (!inputCheck.allowed) {
+      yield { type: "delta", delta: inputCheck.safeReply };
+      yield {
+        type: "done",
+        model: "guardrail:input",
+        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      };
+      await aiRepository.createMessage({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+        role: "assistant",
+        content: inputCheck.safeReply,
+        tokens: 0,
+      });
+      await aiRepository.touchConversationUpdatedAt({
+        conversationId: conversationObjectId,
+        userId: userObjectId,
+      });
+      await aiUsageService.recordUsage({
+        userId,
+        conversationId: String(conversationObjectId),
+        feature: "chat_stream",
+        route: "GUARDRAIL_BLOCKED",
+        model: "guardrail:input",
+        provider: "guardrail",
+        guardrailTriggered: inputCheck.reason,
+        latencyMs: Date.now() - startedAt,
+        status: "blocked",
+      });
+      return;
+    }
+
     const stream = aiProvider.chatStream({
       purpose: "chat",
       messages: [
         {
           role: "system",
           content:
-            "Bạn là trợ lý AI cho ứng dụng quản lý công việc. Luôn trả lời ngắn gọn, bám đúng câu hỏi, đề xuất bước hành động cụ thể khi phù hợp. Không bịa thông tin, không tự mở rộng ngoài phạm vi câu hỏi. Trả lời bằng tiếng Việt trừ khi người dùng viết bằng ngôn ngữ khác.",
+            "Bạn là trợ lý AI cho ứng dụng quản lý công việc TaskMind AI. Luôn trả lời ngắn gọn, bám đúng câu hỏi, đề xuất bước hành động cụ thể khi phù hợp. Không bịa thông tin, không tự mở rộng ngoài phạm vi câu hỏi. Trả lời bằng tiếng Việt trừ khi người dùng viết bằng ngôn ngữ khác.",
         },
+        ...streamHistory,
         { role: "user", content: input.message },
       ],
       model: input.model,
@@ -374,6 +611,7 @@ export const aiChatService = {
     });
 
     let assistantText = "";
+    let streamModel: string | undefined;
     let finalUsage:
       | {
           promptTokens?: number;
@@ -382,32 +620,68 @@ export const aiChatService = {
         }
       | undefined;
 
-    for await (const ev of stream) {
-      if (ev.type === "meta") {
+    try {
+      for await (const ev of stream) {
+        if (ev.type === "meta") {
+          yield ev;
+          continue;
+        }
+        if (ev.type === "delta") {
+          assistantText += ev.delta;
+          yield ev;
+          continue;
+        }
+        streamModel = ev.model;
+        finalUsage = ev.usage;
         yield ev;
-        continue;
       }
-      if (ev.type === "delta") {
-        assistantText += ev.delta;
-        yield ev;
-        continue;
-      }
-      finalUsage = ev.usage;
-      yield ev;
+    } catch (err) {
+      await aiUsageService.recordUsage({
+        userId,
+        conversationId: String(conversationObjectId),
+        feature: "chat_stream",
+        route: "GENERAL_CHAT",
+        model: streamModel,
+        latencyMs: Date.now() - startedAt,
+        status: "error",
+        errorCode: err instanceof Error ? err.message : "UNKNOWN",
+      });
+      throw err;
     }
 
-    if (assistantText) {
+    const sanitizedStream = aiGuardrailService.validateAndSanitizeOutput(
+      assistantText,
+      { validateInternalRoutes: false },
+    );
+
+    if (sanitizedStream.content) {
       await aiRepository.createMessage({
         conversationId: conversationObjectId,
         userId: userObjectId,
         role: "assistant",
-        content: assistantText,
+        content: sanitizedStream.content,
         tokens: finalUsage?.totalTokens,
       });
     }
     await aiRepository.touchConversationUpdatedAt({
       conversationId: conversationObjectId,
       userId: userObjectId,
+    });
+
+    await aiUsageService.recordUsage({
+      userId,
+      conversationId: String(conversationObjectId),
+      feature: "chat_stream",
+      route: "GENERAL_CHAT",
+      model: streamModel,
+      promptTokens: finalUsage?.promptTokens,
+      completionTokens: finalUsage?.completionTokens,
+      totalTokens: finalUsage?.totalTokens,
+      latencyMs: Date.now() - startedAt,
+      guardrailTriggered: sanitizedStream.flags.length
+        ? sanitizedStream.flags.join(",")
+        : undefined,
+      status: "ok",
     });
   },
 

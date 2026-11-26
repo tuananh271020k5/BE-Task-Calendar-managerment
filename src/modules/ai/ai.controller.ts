@@ -1,11 +1,15 @@
 import { Request, Response } from "express";
+import { Types } from "mongoose";
 import { aiService } from "./ai.service";
 import { aiStreamingService } from "./ai.streaming.service";
-
-const getUserId = (req: Request): string | null => {
-  const userId = (req as any).user?.userId;
-  return userId ? String(userId) : null;
-};
+import { aiRepository } from "./ai.repository";
+import { aiCalendarActionService } from "./ai-calendar-action.service";
+import {
+  getUserId,
+  handleAiError,
+  parseOptionalNumber,
+  parseOptionalString,
+} from "./ai-controller.helpers";
 
 export const chat = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -22,55 +26,25 @@ export const chat = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    const modelRaw = body?.model;
-    const model =
-      modelRaw !== undefined && modelRaw !== null
-        ? String(modelRaw).trim()
-        : undefined;
-
-    const temperatureRaw = body?.temperature;
-    const temperature =
-      temperatureRaw !== undefined && temperatureRaw !== null
-        ? Number(temperatureRaw)
-        : undefined;
+    const temperature = parseOptionalNumber(body?.temperature);
     if (
-      temperature !== undefined &&
-      (!Number.isFinite(temperature) || temperature < 0 || temperature > 2)
+      body?.temperature !== undefined &&
+      body?.temperature !== null &&
+      (temperature === undefined || temperature < 0 || temperature > 2)
     ) {
       res.status(400).json({ message: "Temperature không hợp lệ" });
       return;
     }
 
-    const maxTokensRaw = body?.maxTokens;
-    const maxTokens =
-      maxTokensRaw !== undefined && maxTokensRaw !== null
-        ? Number(maxTokensRaw)
-        : undefined;
+    const maxTokens = parseOptionalNumber(body?.maxTokens);
     if (
-      maxTokens !== undefined &&
-      (!Number.isFinite(maxTokens) || Math.floor(maxTokens) <= 0)
+      body?.maxTokens !== undefined &&
+      body?.maxTokens !== null &&
+      (maxTokens === undefined || Math.floor(maxTokens) <= 0)
     ) {
       res.status(400).json({ message: "MaxTokens không hợp lệ" });
       return;
     }
-
-    const conversationIdRaw = body?.conversationId;
-    const conversationId =
-      conversationIdRaw !== undefined && conversationIdRaw !== null
-        ? String(conversationIdRaw).trim()
-        : undefined;
-
-    const parentTaskIdRaw = body?.parentTaskId;
-    const parentTaskId =
-      parentTaskIdRaw !== undefined && parentTaskIdRaw !== null
-        ? String(parentTaskIdRaw).trim()
-        : undefined;
-
-    const systemPromptRaw = body?.systemPrompt;
-    const systemPrompt =
-      systemPromptRaw !== undefined && systemPromptRaw !== null
-        ? String(systemPromptRaw).trim()
-        : undefined;
 
     const fewShotMessages = Array.isArray(body?.fewShotMessages)
       ? (body.fewShotMessages as any[])
@@ -84,147 +58,64 @@ export const chat = async (req: Request, res: Response): Promise<void> => {
           }))
       : undefined;
 
-    // Parse subtask context for 2-layer language system
-    const subtaskContextRaw = body?.subtaskContext;
+    const rawCtx = body?.subtaskContext;
     const subtaskContext =
-      subtaskContextRaw && typeof subtaskContextRaw === "object"
+      rawCtx && typeof rawCtx === "object"
         ? {
-            subtaskTitle: subtaskContextRaw.subtaskTitle
-              ? String(subtaskContextRaw.subtaskTitle)
+            subtaskTitle: rawCtx.subtaskTitle
+              ? String(rawCtx.subtaskTitle)
               : undefined,
-            parentTaskTitle: subtaskContextRaw.parentTaskTitle
-              ? String(subtaskContextRaw.parentTaskTitle)
+            parentTaskTitle: rawCtx.parentTaskTitle
+              ? String(rawCtx.parentTaskTitle)
               : undefined,
-            parentTaskDescription: subtaskContextRaw.parentTaskDescription
-              ? String(subtaskContextRaw.parentTaskDescription)
+            parentTaskDescription: rawCtx.parentTaskDescription
+              ? String(rawCtx.parentTaskDescription)
               : undefined,
-            estimatedDuration: subtaskContextRaw.estimatedDuration
-              ? Number(subtaskContextRaw.estimatedDuration)
+            estimatedDuration: rawCtx.estimatedDuration
+              ? Number(rawCtx.estimatedDuration)
               : undefined,
-            parentEstimatedDuration: subtaskContextRaw.parentEstimatedDuration
-              ? Number(subtaskContextRaw.parentEstimatedDuration)
+            parentEstimatedDuration: rawCtx.parentEstimatedDuration
+              ? Number(rawCtx.parentEstimatedDuration)
               : undefined,
-            dailyTargetMin: subtaskContextRaw.dailyTargetMin
-              ? Number(subtaskContextRaw.dailyTargetMin)
+            dailyTargetMin: rawCtx.dailyTargetMin
+              ? Number(rawCtx.dailyTargetMin)
               : undefined,
-            dailyTargetDuration: subtaskContextRaw.dailyTargetDuration
-              ? Number(subtaskContextRaw.dailyTargetDuration)
+            dailyTargetDuration: rawCtx.dailyTargetDuration
+              ? Number(rawCtx.dailyTargetDuration)
               : undefined,
-            difficulty: subtaskContextRaw.difficulty
-              ? String(subtaskContextRaw.difficulty)
+            difficulty: rawCtx.difficulty
+              ? String(rawCtx.difficulty)
               : undefined,
-            description: subtaskContextRaw.description
-              ? String(subtaskContextRaw.description)
+            description: rawCtx.description
+              ? String(rawCtx.description)
               : undefined,
-            subtaskKey: subtaskContextRaw.subtaskKey
-              ? String(subtaskContextRaw.subtaskKey)
+            subtaskKey: rawCtx.subtaskKey
+              ? String(rawCtx.subtaskKey)
               : undefined,
             subtaskIndex:
-              subtaskContextRaw.subtaskIndex !== undefined &&
-              subtaskContextRaw.subtaskIndex !== null
-                ? Number(subtaskContextRaw.subtaskIndex)
+              rawCtx.subtaskIndex !== undefined && rawCtx.subtaskIndex !== null
+                ? Number(rawCtx.subtaskIndex)
                 : undefined,
           }
         : undefined;
 
     const result = await aiService.chat(userId, {
       message,
-      conversationId,
-      parentTaskId,
-      systemPrompt,
+      conversationId: parseOptionalString(body?.conversationId),
+      parentTaskId: parseOptionalString(body?.parentTaskId),
+      currentPage: parseOptionalString(body?.currentPage),
+      systemPrompt: parseOptionalString(body?.systemPrompt),
       subtaskContext,
       fewShotMessages,
-      model,
+      model: parseOptionalString(body?.model),
       temperature,
       maxTokens: maxTokens !== undefined ? Math.floor(maxTokens) : undefined,
     });
     res.status(200).json(result);
   } catch (err) {
-    const error = err instanceof Error ? err : new Error("UNKNOWN");
-    console.error("[AI_CHAT_ERROR]", error);
-
-    const message = error.message;
-    if (message === "USER_ID_INVALID") {
-      res.status(400).json({ message: "UserId không hợp lệ" });
-      return;
-    }
-    if (message === "CONVERSATION_ID_INVALID") {
-      res.status(400).json({ message: "ConversationId không hợp lệ" });
-      return;
-    }
-    if (message === "NOT_IMPLEMENTED") {
-      res.status(501).json({ message: "Chức năng chưa triển khai" });
-      return;
-    }
-    if (message === "GROQ_API_KEY_MISSING") {
-      res.status(500).json({
-        message: "Thiếu GROQ_API_KEY trong env",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-
-    if (message === "GROQ_UNAUTHORIZED") {
-      res.status(500).json({
-        message: "Groq bị từ chối (API key không hợp lệ hoặc không có quyền).",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-
-    if (message === "GROQ_RATE_LIMIT") {
-      res.status(429).json({
-        message: "Groq bị giới hạn rate limit. Thử lại sau.",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-
-    if (message === "CONVERSATION_FORBIDDEN") {
-      res
-        .status(403)
-        .json({ message: "Không có quyền truy cập conversation này" });
-      return;
-    }
-
-    const lower = message.toLowerCase();
-    if (
-      lower.includes("permission") ||
-      lower.includes("unauthorized") ||
-      lower.includes("403")
-    ) {
-      res.status(500).json({
-        message:
-          "Provider AI bị từ chối (permission/quota/billing). Kiểm tra API key và quyền truy cập.",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-    if (
-      lower.includes("quota") ||
-      lower.includes("rate") ||
-      lower.includes("429")
-    ) {
-      res.status(429).json({
-        message: "Provider AI bị giới hạn quota/rate limit. Thử lại sau.",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-    if (
-      lower.includes("model") &&
-      (lower.includes("not found") || lower.includes("invalid"))
-    ) {
-      res.status(500).json({
-        message: "AI model không hợp lệ. Kiểm tra cấu hình model.",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-
-    res.status(500).json({
-      message: "Lỗi hệ thống",
-      ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
+    handleAiError(res, err, {
+      logPrefix: "[AI_CHAT_ERROR]",
+      includeDevDetail: true,
     });
   }
 };
@@ -247,43 +138,25 @@ export const chatStream = async (
       return;
     }
 
-    const modelRaw = body?.model;
-    const model =
-      modelRaw !== undefined && modelRaw !== null
-        ? String(modelRaw).trim()
-        : undefined;
-
-    const temperatureRaw = body?.temperature;
-    const temperature =
-      temperatureRaw !== undefined && temperatureRaw !== null
-        ? Number(temperatureRaw)
-        : undefined;
+    const temperature = parseOptionalNumber(body?.temperature);
     if (
-      temperature !== undefined &&
-      (!Number.isFinite(temperature) || temperature < 0 || temperature > 2)
+      body?.temperature !== undefined &&
+      body?.temperature !== null &&
+      (temperature === undefined || temperature < 0 || temperature > 2)
     ) {
       res.status(400).json({ message: "Temperature không hợp lệ" });
       return;
     }
 
-    const maxTokensRaw = body?.maxTokens;
-    const maxTokens =
-      maxTokensRaw !== undefined && maxTokensRaw !== null
-        ? Number(maxTokensRaw)
-        : undefined;
+    const maxTokens = parseOptionalNumber(body?.maxTokens);
     if (
-      maxTokens !== undefined &&
-      (!Number.isFinite(maxTokens) || Math.floor(maxTokens) <= 0)
+      body?.maxTokens !== undefined &&
+      body?.maxTokens !== null &&
+      (maxTokens === undefined || Math.floor(maxTokens) <= 0)
     ) {
       res.status(400).json({ message: "MaxTokens không hợp lệ" });
       return;
     }
-
-    const conversationIdRaw = body?.conversationId;
-    const conversationId =
-      conversationIdRaw !== undefined && conversationIdRaw !== null
-        ? String(conversationIdRaw).trim()
-        : undefined;
 
     aiStreamingService.initSse(res);
 
@@ -294,16 +167,14 @@ export const chatStream = async (
 
     const stream = aiService.chatStream(userId, {
       message,
-      conversationId,
-      model,
+      conversationId: parseOptionalString(body?.conversationId),
+      model: parseOptionalString(body?.model),
       temperature,
       maxTokens: maxTokens !== undefined ? Math.floor(maxTokens) : undefined,
     });
 
     for await (const ev of stream) {
-      if (closed) {
-        return;
-      }
+      if (closed) return;
 
       if (ev.type === "meta") {
         aiStreamingService.sendSseEvent(
@@ -328,10 +199,8 @@ export const chatStream = async (
   } catch (err) {
     const error = err instanceof Error ? err : new Error("UNKNOWN");
     console.error("[AI_CHAT_STREAM_ERROR]", error);
-
     const message = error.message;
 
-    // If SSE already started, send an error event
     if (res.headersSent) {
       const payload = {
         message:
@@ -341,49 +210,17 @@ export const chatStream = async (
               ? "ConversationId không hợp lệ"
               : message === "USER_ID_INVALID"
                 ? "UserId không hợp lệ"
-                : "Lỗi hệ thống",
-        ...(process.env.NODE_ENV !== "production"
-          ? { detail: error.message }
-          : {}),
+                : message === "AI_DAILY_QUOTA_EXCEEDED"
+                  ? "Bạn đã đạt giới hạn sử dụng AI trong ngày hôm nay."
+                  : "Lỗi hệ thống",
+        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
       };
-
       aiStreamingService.sendSseEvent(res, payload, "error");
       aiStreamingService.closeSse(res);
       return;
     }
 
-    if (message === "GROQ_RATE_LIMIT") {
-      res
-        .status(429)
-        .json({ message: "Groq bị giới hạn rate limit. Thử lại sau." });
-      return;
-    }
-    if (message === "USER_ID_INVALID") {
-      res.status(400).json({ message: "UserId không hợp lệ" });
-      return;
-    }
-    if (message === "CONVERSATION_ID_INVALID") {
-      res.status(400).json({ message: "ConversationId không hợp lệ" });
-      return;
-    }
-    if (message === "CONVERSATION_FORBIDDEN") {
-      res
-        .status(403)
-        .json({ message: "Không có quyền truy cập conversation này" });
-      return;
-    }
-    if (message === "GROQ_UNAUTHORIZED") {
-      res.status(500).json({
-        message: "Groq bị từ chối (API key không hợp lệ hoặc không có quyền).",
-      });
-      return;
-    }
-    if (message === "GROQ_API_KEY_MISSING") {
-      res.status(500).json({ message: "Thiếu GROQ_API_KEY trong env" });
-      return;
-    }
-
-    res.status(500).json({ message: "Lỗi hệ thống" });
+    handleAiError(res, err);
   }
 };
 
@@ -398,20 +235,13 @@ export const listConversations = async (
       return;
     }
 
-    const limitRaw = (req as any).query?.limit;
-    const limit =
-      limitRaw !== undefined && limitRaw !== null
-        ? Number(limitRaw)
-        : undefined;
+    const limit = parseOptionalNumber((req as any).query?.limit);
     const result = await aiService.listConversations(userId, {
-      limit:
-        limit !== undefined && Number.isFinite(limit)
-          ? Math.floor(limit)
-          : undefined,
+      limit: limit !== undefined ? Math.floor(limit) : undefined,
     });
     res.status(200).json(result);
   } catch (err) {
-    res.status(500).json({ message: "Lỗi hệ thống" });
+    handleAiError(res, err);
   }
 };
 
@@ -432,32 +262,16 @@ export const getConversationById = async (
       return;
     }
 
-    const limitRaw = (req as any).query?.limit;
-    const limit =
-      limitRaw !== undefined && limitRaw !== null
-        ? Number(limitRaw)
-        : undefined;
+    const limit = parseOptionalNumber((req as any).query?.limit);
     const result = await aiService.getConversationById(userId, {
       id,
-      limitMessages:
-        limit !== undefined && Number.isFinite(limit)
-          ? Math.floor(limit)
-          : undefined,
+      limitMessages: limit !== undefined ? Math.floor(limit) : undefined,
     });
     res.status(200).json(result);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "UNKNOWN";
-    if (message === "CONVERSATION_ID_INVALID") {
-      res.status(400).json({ message: "Conversation id không hợp lệ" });
-      return;
-    }
-    if (message === "CONVERSATION_FORBIDDEN") {
-      res
-        .status(403)
-        .json({ message: "Không có quyền truy cập conversation này" });
-      return;
-    }
-    res.status(500).json({ message: "Lỗi hệ thống" });
+    handleAiError(res, err, {
+      invalidConversationMessage: "Conversation id không hợp lệ",
+    });
   }
 };
 
@@ -478,12 +292,7 @@ export const getOrCreateConversationByParent = async (
       return;
     }
 
-    const titleRaw = (req as any).query?.title;
-    const title =
-      titleRaw !== undefined && titleRaw !== null
-        ? String(titleRaw).trim()
-        : undefined;
-
+    const title = parseOptionalString((req as any).query?.title);
     const { aiChatService } = await import("./ai-chat.service");
     const result = await aiChatService.getOrCreateConversationByParentTask(
       userId,
@@ -491,17 +300,9 @@ export const getOrCreateConversationByParent = async (
     );
     res.status(200).json(result);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "UNKNOWN";
-    if (message === "PARENT_TASK_ID_INVALID") {
-      res.status(400).json({ message: "parentTaskId không hợp lệ" });
-      return;
-    }
-    if (message === "USER_ID_INVALID") {
-      res.status(400).json({ message: "UserId không hợp lệ" });
-      return;
-    }
-    console.error("[AI_GET_OR_CREATE_BY_PARENT_ERROR]", err);
-    res.status(500).json({ message: "Lỗi hệ thống" });
+    handleAiError(res, err, {
+      logPrefix: "[AI_GET_OR_CREATE_BY_PARENT_ERROR]",
+    });
   }
 };
 
@@ -532,39 +333,7 @@ export const taskBreakdown = async (
     const result = await aiService.taskBreakdown(userId, { title, deadline });
     res.status(200).json(result);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "UNKNOWN";
-    if (message === "USER_ID_INVALID") {
-      res.status(400).json({ message: "UserId không hợp lệ" });
-      return;
-    }
-    if (message === "AI_JSON_INVALID" || message === "AI_RESPONSE_INVALID") {
-      res.status(500).json({
-        message: "AI trả về dữ liệu không đúng định dạng. Thử lại sau.",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-    if (message === "GROQ_API_KEY_MISSING") {
-      res.status(500).json({ message: "Thiếu GROQ_API_KEY trong env" });
-      return;
-    }
-    if (message === "GROQ_UNAUTHORIZED") {
-      res.status(500).json({
-        message: "Groq bị từ chối (API key không hợp lệ hoặc không có quyền).",
-      });
-      return;
-    }
-    if (message === "GROQ_RATE_LIMIT") {
-      res.status(429).json({
-        message: "Groq bị giới hạn rate limit. Thử lại sau.",
-      });
-      return;
-    }
-    if (message === "NOT_IMPLEMENTED") {
-      res.status(501).json({ message: "Chức năng chưa triển khai" });
-      return;
-    }
-    res.status(500).json({ message: "Lỗi hệ thống" });
+    handleAiError(res, err, { includeDevDetail: true });
   }
 };
 
@@ -595,39 +364,7 @@ export const prioritySuggest = async (
     const result = await aiService.prioritySuggest(userId, { title, deadline });
     res.status(200).json(result);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "UNKNOWN";
-    if (message === "USER_ID_INVALID") {
-      res.status(400).json({ message: "UserId không hợp lệ" });
-      return;
-    }
-    if (message === "AI_JSON_INVALID") {
-      res.status(500).json({
-        message: "AI trả về dữ liệu không đúng định dạng. Thử lại sau.",
-        ...(process.env.NODE_ENV !== "production" ? { detail: message } : {}),
-      });
-      return;
-    }
-    if (message === "GROQ_API_KEY_MISSING") {
-      res.status(500).json({ message: "Thiếu GROQ_API_KEY trong env" });
-      return;
-    }
-    if (message === "GROQ_UNAUTHORIZED") {
-      res.status(500).json({
-        message: "Groq bị từ chối (API key không hợp lệ hoặc không có quyền).",
-      });
-      return;
-    }
-    if (message === "GROQ_RATE_LIMIT") {
-      res.status(429).json({
-        message: "Groq bị giới hạn rate limit. Thử lại sau.",
-      });
-      return;
-    }
-    if (message === "NOT_IMPLEMENTED") {
-      res.status(501).json({ message: "Chức năng chưa triển khai" });
-      return;
-    }
-    res.status(500).json({ message: "Lỗi hệ thống" });
+    handleAiError(res, err, { includeDevDetail: true });
   }
 };
 
@@ -664,65 +401,27 @@ export const schedulePlan = async (
       return;
     }
 
-    // Validate strategy and distribution
     const validStrategies = ["sequential", "parallel", "balanced"];
     const validDistributions = ["front-load", "even", "adaptive"];
-    const strategy =
-      schedulingStrategy && validStrategies.includes(schedulingStrategy)
-        ? schedulingStrategy
-        : undefined;
-    const distribution =
-      distributionPattern && validDistributions.includes(distributionPattern)
-        ? distributionPattern
-        : undefined;
 
     const result = await aiService.schedulePlan(userId, {
       taskIds,
       startDate,
-      schedulingStrategy: strategy,
-      distributionPattern: distribution,
+      schedulingStrategy: validStrategies.includes(schedulingStrategy)
+        ? schedulingStrategy
+        : undefined,
+      distributionPattern: validDistributions.includes(distributionPattern)
+        ? distributionPattern
+        : undefined,
     });
     res.status(200).json(result);
   } catch (err) {
-    console.error("schedulePlan error:", err);
-    const message = err instanceof Error ? err.message : "UNKNOWN";
-    if (message === "NOT_IMPLEMENTED") {
-      res.status(501).json({ message: "Chức năng chưa triển khai" });
-      return;
-    }
-    if (message === "TASK_NOT_FOUND") {
-      res.status(404).json({ message: "Không tìm thấy công việc" });
-      return;
-    }
-    if (message === "USER_ID_INVALID") {
-      res.status(400).json({ message: "User ID không hợp lệ" });
-      return;
-    }
-    if (message === "TASK_ID_INVALID") {
-      res.status(400).json({ message: "Task ID không hợp lệ" });
-      return;
-    }
-    if (message === "AI_JSON_INVALID" || message === "AI_RESPONSE_INVALID") {
-      res.status(502).json({ message: "AI trả về phản hồi không hợp lệ" });
-      return;
-    }
-    if (message === "GROQ_API_KEY_MISSING") {
-      res.status(500).json({ message: "Thiếu GROQ_API_KEY trong env" });
-      return;
-    }
-    if (message === "GROQ_UNAUTHORIZED") {
-      res.status(500).json({
-        message: "Groq bị từ chối (API key không hợp lệ hoặc không có quyền).",
-      });
-      return;
-    }
-    if (message === "GROQ_RATE_LIMIT") {
-      res.status(429).json({
-        message: "Groq bị giới hạn rate limit. Thử lại sau.",
-      });
-      return;
-    }
-    res.status(500).json({ message: "Lỗi hệ thống", error: message });
+    handleAiError(res, err, {
+      logPrefix: "schedulePlan error:",
+      invalidUserMessage: "User ID không hợp lệ",
+      invalidJsonStatus: 502,
+      includeErrorDetail: true,
+    });
   }
 };
 
@@ -760,20 +459,13 @@ export const smartReschedule = async (
       },
       reason,
     });
-
     res.status(200).json(result);
   } catch (err) {
-    const message = err instanceof Error ? err.message : "UNKNOWN";
-
-    if (message === "USER_ID_INVALID") {
-      res.status(400).json({ message: "User ID không hợp lệ" });
-      return;
-    }
-    if (message === "TASK_NOT_FOUND") {
-      res.status(404).json({ message: "Không tìm thấy task" });
-      return;
-    }
-    res.status(500).json({ message: "Lỗi hệ thống", error: message });
+    handleAiError(res, err, {
+      invalidUserMessage: "User ID không hợp lệ",
+      notFoundTaskMessage: "Không tìm thấy task",
+      includeErrorDetail: true,
+    });
   }
 };
 
@@ -787,13 +479,13 @@ export const deleteConversation = async (
       res.status(401).json({ message: "Chưa đăng nhập" });
       return;
     }
-    const { Types } = await import("mongoose");
+
     const id = String((req as any).params?.id ?? "").trim();
     if (!id || !Types.ObjectId.isValid(id)) {
       res.status(400).json({ message: "Conversation id không hợp lệ" });
       return;
     }
-    const { aiRepository } = await import("./ai.repository");
+
     const deleted = await aiRepository.deleteConversation({
       conversationId: new Types.ObjectId(id),
       userId: new Types.ObjectId(userId),
@@ -803,8 +495,8 @@ export const deleteConversation = async (
       return;
     }
     res.status(200).json({ message: "Đã xóa cuộc trò chuyện" });
-  } catch {
-    res.status(500).json({ message: "Lỗi hệ thống" });
+  } catch (err) {
+    handleAiError(res, err);
   }
 };
 
@@ -818,18 +510,19 @@ export const renameConversation = async (
       res.status(401).json({ message: "Chưa đăng nhập" });
       return;
     }
-    const { Types } = await import("mongoose");
+
     const id = String((req as any).params?.id ?? "").trim();
     if (!id || !Types.ObjectId.isValid(id)) {
       res.status(400).json({ message: "Conversation id không hợp lệ" });
       return;
     }
+
     const title = String((req as any).body?.title ?? "").trim();
     if (!title) {
       res.status(400).json({ message: "Title không được để trống" });
       return;
     }
-    const { aiRepository } = await import("./ai.repository");
+
     const updated = await aiRepository.renameConversation({
       conversationId: new Types.ObjectId(id),
       userId: new Types.ObjectId(userId),
@@ -840,8 +533,8 @@ export const renameConversation = async (
       return;
     }
     res.status(200).json({ message: "Đã đổi tên", title: updated.title });
-  } catch {
-    res.status(500).json({ message: "Lỗi hệ thống" });
+  } catch (err) {
+    handleAiError(res, err);
   }
 };
 
@@ -855,12 +548,9 @@ export const applyCalendarAction = async (
       res.status(401).json({ message: "Chưa đăng nhập" });
       return;
     }
-    const { Types } = await import("mongoose");
-    const { DailyRoutine } = await import("../routine/routine.model");
-    const { Task } = await import("../task/task.model");
 
     const body = (req as any).body ?? {};
-    const targetDate = String(body.targetDate || "").trim(); // "YYYY-MM-DD"
+    const targetDate = String(body.targetDate || "").trim();
     const actions: any[] = Array.isArray(body.actions) ? body.actions : [];
 
     if (!targetDate && actions.length === 0) {
@@ -868,143 +558,35 @@ export const applyCalendarAction = async (
       return;
     }
 
-    const userObjectId = new Types.ObjectId(userId);
-    let appliedCount = 0;
-    const results: string[] = [];
-
-    for (const item of actions) {
-      if (item.checked === false) continue; // Bỏ qua nếu user bỏ tích
-
-      if (item.action === "cancel_routine") {
-        // Exclude routine for targetDate
-        let routineMatch = null;
-        if (item.routineId && Types.ObjectId.isValid(item.routineId)) {
-          routineMatch = await DailyRoutine.findOne({
-            _id: new Types.ObjectId(item.routineId),
-            userId: userObjectId,
-          });
-        }
-        if (!routineMatch && item.title) {
-          routineMatch = await DailyRoutine.findOne({
-            userId: userObjectId,
-            title: {
-              $regex: new RegExp(
-                item.title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-                "i",
-              ),
-            },
-          });
-        }
-
-        if (routineMatch) {
-          const dateToExclude = targetDate || item.date;
-          if (dateToExclude) {
-            await DailyRoutine.updateOne(
-              { _id: routineMatch._id },
-              { $addToSet: { excludedDates: dateToExclude } },
-            );
-            appliedCount++;
-            results.push(
-              `Đã bỏ thói quen "${routineMatch.title}" ngày ${dateToExclude}`,
-            );
-          }
-        }
-      } else if (item.action === "replace") {
-        // 1. Exclude old routine if matching oldTitle
-        if (item.oldTitle) {
-          const oldRoutine = await DailyRoutine.findOne({
-            userId: userObjectId,
-            title: {
-              $regex: new RegExp(
-                item.oldTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-                "i",
-              ),
-            },
-          });
-          const dateToExclude =
-            targetDate || (item.start ? item.start.slice(0, 10) : "");
-          if (oldRoutine && dateToExclude) {
-            await DailyRoutine.updateOne(
-              { _id: oldRoutine._id },
-              { $addToSet: { excludedDates: dateToExclude } },
-            );
-          }
-        }
-
-        // 2. Create the replacement task
-        const title = item.newTitle || item.title;
-        if (title && item.start && item.end) {
-          await Task.create({
-            userId: userObjectId,
-            title,
-            type: "event",
-            priority: "medium",
-            status: "scheduled",
-            scheduledTime: {
-              start: new Date(item.start),
-              end: new Date(item.end),
-              aiPlanned: true,
-              reason:
-                item.reason ||
-                (item.oldTitle ? `Thay thế ${item.oldTitle}` : "AI điều phối"),
-            },
-          });
-          appliedCount++;
-          results.push(`Đã đổi thành "${title}" (${item.time || ""})`);
-        }
-      } else if (item.action === "create_event" || item.action === "create") {
-        const title = item.title;
-        if (title && item.start && item.end) {
-          if (item.taskId && Types.ObjectId.isValid(item.taskId)) {
-            // Update existing backlog task
-            await Task.updateOne(
-              { _id: new Types.ObjectId(item.taskId), userId: userObjectId },
-              {
-                $set: {
-                  status: "scheduled",
-                  scheduledTime: {
-                    start: new Date(item.start),
-                    end: new Date(item.end),
-                    aiPlanned: true,
-                    reason: item.reason || "Lên lịch theo đề xuất AI",
-                  },
-                },
-              },
-            );
-            appliedCount++;
-            results.push(`Đã lên lịch cho task "${title}"`);
-          } else {
-            // Create new task event
-            await Task.create({
-              userId: userObjectId,
-              title,
-              type: "event",
-              priority: item.category === "work" ? "high" : "medium",
-              status: "scheduled",
-              scheduledTime: {
-                start: new Date(item.start),
-                end: new Date(item.end),
-                aiPlanned: true,
-                reason: item.reason || "Lên lịch theo đề xuất AI",
-              },
-            });
-            appliedCount++;
-            results.push(`Đã thêm lịch "${title}" (${item.time || ""})`);
-          }
-        }
-      }
-    }
-
-    res.status(200).json({
-      success: true,
-      appliedCount,
-      message: `Đã áp dụng thành công ${appliedCount} thay đổi lên lịch trình!`,
-      details: results,
+    const result = await aiCalendarActionService.applyActions(userId, {
+      targetDate,
+      actions,
     });
+    res.status(200).json(result);
   } catch (error: any) {
     res.status(500).json({
       message: "Lỗi khi áp dụng lịch trình",
       error: error?.message || String(error),
     });
+  }
+};
+
+export const getUsageSummary = async (
+  req: Request,
+  res: Response,
+): Promise<void> => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) {
+      res.status(401).json({ message: "Chưa đăng nhập" });
+      return;
+    }
+
+    const days = parseOptionalNumber((req as any).query?.days) ?? 7;
+    const { aiUsageService } = await import("./ai-usage.service");
+    const summary = await aiUsageService.getUserUsageSummary(userId, days);
+    res.status(200).json(summary);
+  } catch (err) {
+    handleAiError(res, err);
   }
 };

@@ -6,9 +6,11 @@
 coverage
 #production
 /build
+/dist
 
 #misc
 .env
+.mcp.json
 .DS_Store
 .idea
 .vscode

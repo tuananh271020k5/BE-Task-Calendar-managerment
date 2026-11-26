@@ -19,6 +19,7 @@ import colorsRouter from "./modules/colors/colors.routes";
 import teamRouter from "./modules/team/team.routes";
 import catalogRouter from "./modules/catalog/catalog.routes";
 import routineRouter from "./modules/routine/routine.routes";
+import mcpRouter from "./modules/ai/mcp/mcp.routes";
 import { setupPassport } from "./config/passport";
 import helmet from "helmet";
 import { globalLimiter } from "./middleware/rate-limit.middleware";
@@ -54,7 +55,8 @@ export const createApp = (): Express => {
       origin: getAllowedCorsOrigins(),
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization"],
+      allowedHeaders: ["Content-Type", "Authorization", "Mcp-Session-Id"],
+      exposedHeaders: ["Mcp-Session-Id"],
     }),
   );
 
@@ -107,6 +109,7 @@ export const createApp = (): Express => {
   app.use("/teams", teamRouter);
   app.use("/catalog", catalogRouter);
   app.use("/routines", routineRouter);
+  app.use("/mcp", mcpRouter);
 
   return app;
 };

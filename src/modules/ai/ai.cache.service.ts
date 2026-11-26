@@ -3,6 +3,53 @@ import { getRedis } from "../../services/redis.service";
 import { CACHE_VERSION, versionedKey } from "../../config/cache-version";
 
 const AI_CACHE_TTL_SECONDS = 300; // 5 minutes default for AI responses
+const BREAKDOWN_CACHE_TTL_SECONDS = 86400; // 24 hours for shared task breakdown cache
+
+const normalizeCacheSegment = (text?: string): string =>
+  String(text ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+
+export const buildTaskBreakdownCacheKey = (params: {
+  title: string;
+  description?: string;
+  totalMinutes?: number;
+  profileKey?: string;
+  model?: string;
+}): string => {
+  const modelPart = params.model || "default";
+  const payload = [
+    normalizeCacheSegment(params.title),
+    normalizeCacheSegment(params.description),
+    params.totalMinutes !== undefined && params.totalMinutes !== null
+      ? String(params.totalMinutes)
+      : "auto",
+    params.profileKey || "default",
+  ].join("|");
+
+  const hash = crypto
+    .createHash("sha256")
+    .update(payload)
+    .digest("hex")
+    .slice(0, 20);
+
+  return versionedKey(
+    CACHE_VERSION.AI,
+    `ai:task-breakdown:shared:${hash}:${modelPart}`,
+  );
+};
+
+export type CachedTaskBreakdown = {
+  steps: {
+    title: string;
+    status: string;
+    estimatedDuration?: number;
+    difficulty?: "easy" | "medium" | "hard";
+    description?: string;
+  }[];
+  totalEstimatedDuration?: number;
+};
 
 export const aiCacheService = {
   buildPromptHash: (prompt: string): string => {
@@ -25,7 +72,7 @@ export const aiCacheService = {
     await redis.set(key, value, "EX", ttlSeconds);
   },
 
-  // Task Breakdown cache methods
+  // Task Breakdown cache methods (shared key omits userId & deadline)
   getTaskBreakdown: async (params: {
     userId: string;
     title: string;
@@ -34,30 +81,13 @@ export const aiCacheService = {
     totalMinutes?: number;
     profileKey?: string;
     model?: string;
-  }): Promise<{ steps: { title: string; status: string }[] } | null> => {
+  }): Promise<CachedTaskBreakdown | null> => {
     try {
       const redis = getRedis();
-      const deadlinePart = params.deadline
-        ? params.deadline.toISOString()
-        : "no-deadline";
-      const modelPart = params.model || "default";
-      const titleHash = crypto
-        .createHash("sha256")
-        .update(
-          params.title +
-            (params.description || "") +
-            (params.totalMinutes?.toString() || "") +
-            (params.profileKey || ""),
-        )
-        .digest("hex")
-        .slice(0, 16);
-      const baseKey = `ai:task-breakdown:${params.userId}:${titleHash}:${deadlinePart}:${modelPart}`;
-      const key = versionedKey(CACHE_VERSION.AI, baseKey);
+      const key = buildTaskBreakdownCacheKey(params);
       const cached = await redis.get(key);
       if (!cached) return null;
-      return JSON.parse(cached) as {
-        steps: { title: string; status: string }[];
-      };
+      return JSON.parse(cached) as CachedTaskBreakdown;
     } catch {
       return null;
     }
@@ -73,27 +103,12 @@ export const aiCacheService = {
       profileKey?: string;
       model?: string;
     },
-    value: { steps: { title: string; status: string }[] },
-    ttlSeconds: number = AI_CACHE_TTL_SECONDS,
+    value: CachedTaskBreakdown,
+    ttlSeconds: number = BREAKDOWN_CACHE_TTL_SECONDS,
   ): Promise<void> => {
     try {
       const redis = getRedis();
-      const deadlinePart = params.deadline
-        ? params.deadline.toISOString()
-        : "no-deadline";
-      const modelPart = params.model || "default";
-      const titleHash = crypto
-        .createHash("sha256")
-        .update(
-          params.title +
-            (params.description || "") +
-            (params.totalMinutes?.toString() || "") +
-            (params.profileKey || ""),
-        )
-        .digest("hex")
-        .slice(0, 16);
-      const baseKey = `ai:task-breakdown:${params.userId}:${titleHash}:${deadlinePart}:${modelPart}`;
-      const key = versionedKey(CACHE_VERSION.AI, baseKey);
+      const key = buildTaskBreakdownCacheKey(params);
       await redis.setex(key, ttlSeconds, JSON.stringify(value));
     } catch {
       // Silently fail - cache is best-effort
@@ -152,6 +167,30 @@ export const aiCacheService = {
       const baseKey = `ai:priority-suggest:${params.userId}:${titleHash}:${deadlinePart}:${modelPart}`;
       const key = versionedKey(CACHE_VERSION.AI, baseKey);
       await redis.setex(key, ttlSeconds, JSON.stringify(value));
+    } catch {
+      // Silently fail - cache is best-effort
+    }
+  },
+
+  getGuideReply: async (cacheKey: string): Promise<string | null> => {
+    try {
+      const redis = getRedis();
+      const key = versionedKey(CACHE_VERSION.AI, `ai:guide:${cacheKey}`);
+      return await redis.get(key);
+    } catch {
+      return null;
+    }
+  },
+
+  setGuideReply: async (
+    cacheKey: string,
+    reply: string,
+    ttlSeconds: number = 3600,
+  ): Promise<void> => {
+    try {
+      const redis = getRedis();
+      const key = versionedKey(CACHE_VERSION.AI, `ai:guide:${cacheKey}`);
+      await redis.setex(key, ttlSeconds, reply);
     } catch {
       // Silently fail - cache is best-effort
     }

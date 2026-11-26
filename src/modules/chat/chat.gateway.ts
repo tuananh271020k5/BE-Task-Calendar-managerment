@@ -78,6 +78,13 @@ export class ChatGateway {
       const pubClient = redis.duplicate();
       const subClient = redis.duplicate();
 
+      pubClient.on("error", (err) => {
+        console.error("[SocketIO Redis] pubClient error:", err.message);
+      });
+      subClient.on("error", (err) => {
+        console.error("[SocketIO Redis] subClient error:", err.message);
+      });
+
       this.io.adapter(createAdapter(pubClient, subClient));
       console.log("Redis pub/sub adapter enabled for Socket.IO scaling");
     } catch (err) {

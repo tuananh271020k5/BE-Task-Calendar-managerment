@@ -85,7 +85,6 @@ const freeTimeSchema = new Schema<FreeTimeDoc>(
       type: Schema.Types.ObjectId,
       required: true,
       unique: true,
-      index: true,
       ref: "User",
     },
     weeklyPattern: {
@@ -111,7 +110,6 @@ const freeTimeSchema = new Schema<FreeTimeDoc>(
   { timestamps: true },
 );
 
-freeTimeSchema.index({ userId: 1 }, { unique: true });
 freeTimeSchema.index({ "customDates.date": 1 });
 
 export const FreeTime =

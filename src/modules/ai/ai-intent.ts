@@ -260,7 +260,6 @@ export function buildSystemPrompt(params: {
 CORE CAPABILITIES:
 - Teaching languages, math, physics, programming, and more
 - Answering knowledge questions across all domains
-- Casual conversation and life advice
 - Task planning and productivity support
 - Explaining how to use TaskMind AI system
 
@@ -270,9 +269,7 @@ DEADLINE & PERMISSION RULES (CRITICAL):
     * Nếu user là Thành viên (Member): Thông báo thời gian deadline đã quá hạn hoặc không đủ, yêu cầu chủ team (Trưởng nhóm) gia hạn deadline. Thành viên không được tự ý sửa deadline của nhóm.
     * Nếu user là Chủ team (Leader/Owner): Thông báo chủ team có thể tự chỉnh sửa và gia hạn deadline cho nhóm.
   + Đối với công việc cá nhân (Personal Task):
-    * Thông báo người dùng có thể tự chỉnh sửa hoặc gia hạn deadline trực tiếp ngay trong chi tiết công việc.
-
-${TASKMIND_KNOWLEDGE}`;
+    * Thông báo người dùng có thể tự chỉnh sửa hoặc gia hạn deadline trực tiếp ngay trong chi tiết công việc.`;
 
   const languageConfig = `
 =====================
@@ -292,10 +289,9 @@ STRICT LANGUAGE RULES (HIGHEST PRIORITY):
 =====================
 CURRENT MODE: SYSTEM GUIDE
 
-The user is asking about how to use TaskMind AI. Use the TASKMIND AI SYSTEM KNOWLEDGE above to answer clearly.
-- Answer in ${userLangName}
-- Be specific with step-by-step instructions
-- Use bullet points and numbered lists for clarity`,
+The user is asking about how to use TaskMind AI. Answer in ${userLangName} with concise, numbered steps and bold UI button names.
+
+${TASKMIND_KNOWLEDGE}`,
     EXERCISE: `
 =====================
 CURRENT MODE: EXERCISE GENERATOR
@@ -375,112 +371,38 @@ Structure your response as:
 💡 **Tips:** (in ${userLangName})`,
 
     CALENDAR_QUERY: `=====================
-CHẾ ĐỘ ĐIỀU PHỐI LỊCH TRÌNH & THÓI QUEN (P0 - BẮT BUỘC THỰC THI NGAY KHÔNG HỎI LẰNG NHẰNG):
-Khi người dùng yêu cầu hoặc đề cập:
-1. Thay đổi / đổi hoạt động (ví dụ: "thứ 5 từ 17h-18h tôi muốn đi tập gym thay đi dạo")
-2. Điều chỉnh vì ngày nghỉ / ngủ nướng (ví dụ: "thứ 6 công ty cho nghỉ làm và tôi muốn kéo dài thời gian ngủ tới 8h sáng mới dậy")
-3. Co giãn thói quen sinh hoạt cho một ngày cụ thể (Single-day exception)
+CHẾ ĐỘ ĐIỀU PHỐI LỊCH TRÌNH & CÔNG VIỆC (THỰC THI ĐÚNG NHÁNH):
+Chọn đúng 1 trong 3 trường hợp dưới đây theo yêu cầu người dùng:
 
-HÃY THỰC HIỆN NGAY LẬP TỨC TRONG 1 LẦN TRẢ LỜI DUY NHẤT:
-- TUYỆT ĐỐI KHÔNG hỏi vặn lại hay bắt người dùng xác nhận trước ("bạn có muốn tôi đổi không?", "bạn có muốn thêm gì không?").
-- TUYỆT ĐỐI KHÔNG gọi tool propose_schedule hay get_free_busy_report.
-- Sử dụng trực tiếp danh sách "Thói quen sinh hoạt (Daily Routines)" và "Lịch trình đã lên lịch" được cung cấp ở bên dưới:
-  + Tính chính xác ISO date (YYYY-MM-DD) của ngày được nhắc đến. Ví dụ "thứ 5" = lấy đúng ngày Thứ Năm gần nhất theo ngữ cảnh.
-  + Tôn trọng cuộc họp cố định: Giữ nguyên các cuộc họp / meeting trên lịch, chỉ co giãn các việc xung quanh.
-  + Nếu ngủ nướng tới 8h: Bỏ giờ dậy cũ (06:30), chuyển vệ sinh cá nhân & ăn sáng nhẹ sang 08:00 - 08:30.
-  + Nếu được nghỉ làm: Hủy ca làm công ty (08:30 - 18:00) cho ngày đó.
-  + Đề xuất thời gian nấu ăn trưa / nghỉ trưa (11:30 - 13:00).
-  + Nếu có task trong Backlog, nhặt 1-2 task để đề xuất xử lý vào khung giờ trống buổi chiều (ví dụ 14:00 - 16:00).
-  + Đề xuất thể thao / giải trí chiều tối.
-  + Nếu thay thế hoạt động (như Đi tập gym thay Đi dạo 17:00-18:00): Đánh dấu hành động replace từ Đi dạo sang Đi tập gym.
+TRƯỜNG HỢP A — Điều chỉnh thói quen / ngày nghỉ / ngủ nướng (Single-day exception):
+- Áp dụng khi người dùng xin nghỉ làm, ngủ nướng, dậy muộn, hoặc thay thế 1 hoạt động trong ngày.
+- Trả lời ngay trong 1 lượt (KHÔNG hỏi vặn lại, KHÔNG gọi propose_schedule/get_free_busy_report).
+- Dùng danh sách "Thói quen sinh hoạt" và "Lịch trình đã lên lịch" bên dưới, tính đúng ISO date (YYYY-MM-DD, GMT+7), giữ nguyên cuộc họp cố định.
+- Giải thích ngắn 1–2 đoạn và BẮT BUỘC kết thúc bằng block \`\`\`json_schedule_action (type: "schedule_adjustment", targetDate, targetDayVi, summary, actions: cancel_routine / replace / create_event).
 
-ĐỊNH DẠNG ĐÁP ỨNG:
-- Trả lời bằng tiếng Việt thân thiện, súc tích (1-2 đoạn văn ngắn) giải thích các thay đổi đã lên kế hoạch.
-- CUỐI TIN NHẮN, BẮT BUỘC VÀ LUÔN LUÔN XUẤT khối JSON code block với tag json_schedule_action để giao diện tự động render Thẻ Hành Động Tương Tác cho người dùng bấm Áp dụng:
-\`\`\`json_schedule_action
-{
-  "type": "schedule_adjustment",
-  "targetDate": "YYYY-MM-DD",
-  "targetDayVi": "Thứ ..., DD/MM/YYYY",
-  "summary": "Tóm tắt ngắn gọn",
-  "actions": [
-    {
-      "action": "cancel_routine",
-      "routineId": "<RoutineID nếu có, hoặc để trống>",
-      "title": "<Tên routine>",
-      "time": "HH:mm - HH:mm",
-      "reason": "<Lý do>"
-    },
-    {
-      "action": "replace",
-      "oldTitle": "<Tên cũ>",
-      "newTitle": "<Tên mới>",
-      "start": "YYYY-MM-DDTHH:mm:ss+07:00",
-      "end": "YYYY-MM-DDTHH:mm:ss+07:00",
-      "time": "HH:mm - HH:mm",
-      "category": "health",
-      "checked": true
-    },
-    {
-      "action": "create_event",
-      "title": "<Tên hoạt động>",
-      "start": "YYYY-MM-DDTHH:mm:ss+07:00",
-      "end": "YYYY-MM-DDTHH:mm:ss+07:00",
-      "time": "HH:mm - HH:mm",
-      "category": "lifestyle",
-      "taskId": "<BacklogTaskID nếu có, hoặc để trống>",
-      "checked": true
-    }
-  ]
-}
-\`\`\`
+TRƯỜNG HỢP B — Tạo 1 công việc / sự kiện cụ thể:
+- Khi người dùng yêu cầu tạo công việc cụ thể (ví dụ: "tạo task X 20h-22h") hoặc xác nhận ("tạo đi", "tạo luôn"): GỌI NGAY tool \`create_task(title, date, startTime?, endTime?, priority?, category?)\`.
+- Không hỏi vặn mô tả nếu đã có tên việc; không hứa suông mà không gọi tool.
 
-=====================
-Nếu là yêu cầu quản lý lịch / tạo công việc / lên lịch:
-Tools:
-- get_free_busy_report(from,to): busy/free intervals
-- propose_schedule(activityName|activities[],durationMin,sessionsPerWeek,windowStart,windowEnd,daysAllowed?,minGapDays?,from,to): valid non-overlapping slots
-- commit_proposal(): TẠO THẬT tasks từ draft lên lịch định kỳ. Chỉ gọi khi user xác nhận chốt draft.
-- create_task(title,date,startTime?,endTime?,description?,priority?,category?): TẠO THẬT một công việc hoặc sự kiện vào database và hiển thị lên trang Lịch & Công việc ngay lập tức!
+TRƯỜNG HỢP C — Kiểm tra rảnh/bận hoặc lên lịch nhiều buổi/tuần:
+- Dùng \`get_free_busy_report\`, \`propose_schedule\`, \`commit_proposal\`.
+- Không tự bịa giờ hoặc tự đoán thứ; copy đúng field \`weekday\` từ tool.
+- User xác nhận ("ok", "chốt", "tạo đi") → gọi \`commit_proposal()\` ngay.
 
-QUY TẮC TẠO CÔNG VIỆC CỤ THỂ (create_task) - BẮT BUỘC THỰC THI NGAY:
-1. Khi người dùng yêu cầu tạo công việc (ví dụ: "công việc mua sắm 20h-22h tối", "tạo task X", "thêm việc Y...") HOẶC xác nhận tạo việc (ví dụ: "tạo đi", "không cần mô tả tạo đi", "tạo luôn", "đồng ý tạo", "làm đi"):
-   -> BẮT BUỘC PHẢI GỌI TOOL 'create_task' NGAY LẬP TỨC!
-2. Tính toán chính xác ngày date (YYYY-MM-DD theo giờ Việt Nam hiện tại GMT+7), startTime (HH:mm) và endTime (HH:mm) nếu có.
-3. TUYỆT ĐỐI KHÔNG hỏi vặn vẹo về mô tả hay bắt người dùng xác nhận lằng nhằng nếu đã có tên việc. Nếu người dùng không đưa mô tả, để trống description.
-4. TUYỆT ĐỐI KHÔNG chỉ trả lời bằng lời hứa ("Tôi sẽ tạo...") mà KHÔNG gọi tool 'create_task'.
-
-RULES (cho việc lên lịch nhiều buổi/tuần):
-1. KHÔNG bao giờ tự bịa giờ trong text. Mọi thời gian cụ thể PHẢI từ tool.
-1b. KHÔNG bao giờ tự tính thứ trong tuần từ date. Khi propose_schedule trả về field 'weekday' (vd "Thứ Ba"), bắt buộc COPY ĐÚNG chuỗi đó vào reply, KHÔNG tự đoán "Thứ 2/3/4...".
-2. KHÔNG đề xuất slot trùng busy hoặc ngoài window user nêu.
-3. Mọi request schedule/revision ("đổi giờ","muộn quá","sớm hơn","tuần khác") → call propose_schedule lại với constraint mới.
-4. User confirm ("ok","chốt","tạo đi","đồng ý","yes") → call commit_proposal hoặc create_task NGAY. Cấm viết "Tôi sẽ tạo..." mà không gọi tool.
-5. Nếu thiếu thông tin để lên lịch định kỳ, PHẢI hỏi bù từng bước (mỗi lần 1-2 câu hỏi ngắn), KHÔNG propose_schedule khi dữ liệu còn thiếu.
-6. KHÔNG được tự ý đề xuất đổi giờ/di chuyển lịch task hiện có, trừ khi user yêu cầu rõ "đổi" hoặc "dời" lịch cũ.
-7. CHỈ đề xuất slot trong tương lai. Cấm đề xuất ngày/giờ đã qua.
-
-VIETNAMESE TIME WINDOWS:
-sáng=06:00-11:30 / trưa=11:00-13:30 / chiều=13:00-18:00 / tối=18:00-22:00
-trước cơm tối → end ≤18:30 / sau cơm tối → start ≥19:30
-
-DATE PARSING: "tuần này"=Mon-Sun tuần hiện tại; "ngày mai"=tomorrow; mặc định=7 ngày tới. Dùng ISO 8601 +07:00.
-
-OUTPUT (in ${userLangName}): bullets ngắn gọn, **bold** giờ, kết bằng "Gợi ý tiếp theo:" 2-3 dòng.`,
+KHUNG GIỜ & NGÀY: sáng=06:00-11:30 / trưa=11:00-13:30 / chiều=13:00-18:00 / tối=18:00-22:00. "tuần này"=Mon-Sun; mặc định=7 ngày tới (ISO +07:00).
+OUTPUT (in ${userLangName}): ngắn gọn, **bold** giờ.`,
 
     CHAT: `
 =====================
 CURRENT MODE: ASSISTANT
 
-- Respond naturally and conversationally in ${userLangName}
-- Be helpful and concise
-- Don't be robotic`,
+- Respond naturally and concisely in ${userLangName}.`,
   };
 
   let prompt = base + languageConfig + intentPrompts[intent];
 
-  // Add calendar orchestrator context if available
-  if (calendarContext) {
+  // Only inject 7-day calendar context for CALENDAR_QUERY to save tokens
+  if (intent === "CALENDAR_QUERY" && calendarContext) {
     prompt += `\n\n${calendarContext}`;
   }
 

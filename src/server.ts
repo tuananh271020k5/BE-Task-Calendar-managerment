@@ -13,7 +13,7 @@ import { initChatGateway } from "./modules/chat/chat.gateway";
 import { reminderCronService } from "./modules/notification/reminder.cron";
 import { cacheCleanupService } from "./services/cache-cleanup.service";
 import { initCronJobs } from "./services/cron.service";
-import "./modules/notification/notification.worker";
+import { startNotificationWorker } from "./modules/notification/notification.worker";
 
 const bootstrap = async (): Promise<void> => {
   await connect();
@@ -48,7 +48,7 @@ const bootstrap = async (): Promise<void> => {
     // Start reminder cron job
     reminderCronService.start();
     console.log(`Reminder cron job started for deadline alerts`);
-    console.log(`Notification worker started for queue processing`);
+    void startNotificationWorker();
 
     // Start cache cleanup job
     cacheCleanupService.start();

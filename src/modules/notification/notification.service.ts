@@ -6,7 +6,7 @@ import {
   NotificationPriority,
   NotificationDoc,
 } from "./notification.model";
-import { notificationQueue } from "./notification.queue";
+import { notificationQueueService } from "./notification.queue";
 import { userRepository } from "../user/user.repository";
 
 export type PublicNotification = {
@@ -420,24 +420,13 @@ export const notificationService = {
 
     if (notification.channels.email) {
       try {
-        await notificationQueue.add(
-          "send-email",
-          {
-            userId: data.userId,
-            email: data.data?.userEmail || prefs.email || "user@example.com",
-            subject: data.title,
-            html: generateEmailHtml(data.title, data.content),
-            notificationId: String(notification._id),
-          },
-          {
-            priority: 2,
-            attempts: 5,
-            backoff: {
-              type: "exponential",
-              delay: 5000,
-            },
-          },
-        );
+        await notificationQueueService.addEmail({
+          userId: data.userId,
+          email: data.data?.userEmail || prefs.email || "user@example.com",
+          subject: data.title,
+          html: generateEmailHtml(data.title, data.content),
+          notificationId: String(notification._id),
+        });
       } catch (err) {
         console.error("[NotificationService] Failed to queue email job:", err);
       }
@@ -584,7 +573,7 @@ export const notificationService = {
         })),
       });
 
-      await notificationQueue.add("send-email", {
+      await notificationQueueService.addEmail({
         userId,
         email,
         subject,
