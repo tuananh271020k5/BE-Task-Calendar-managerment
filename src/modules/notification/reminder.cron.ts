@@ -62,10 +62,12 @@ async function scanAndNotifyDeadlines(): Promise<void> {
     const now = new Date();
     const oneHourFromNow = new Date(now.getTime() + 60 * 60 * 1000); // 1 giờ sau
 
-    // Tìm tasks có deadline trong vòng 1 giờ tới và chưa completed/cancelled
+    // Tìm task gốc/cha có deadline trong vòng 1 giờ tới và chưa completed/cancelled
+    // Loại trừ task con phiên làm việc (parentTaskId) để không bắn trùng DEADLINE_ALERT cho (Phiên 1/3)...
     const tasks = await Task.find({
       deadline: { $gte: now, $lte: oneHourFromNow },
       status: { $nin: ["completed", "cancelled"] },
+      $or: [{ parentTaskId: { $exists: false } }, { parentTaskId: null }],
     }).lean();
 
     for (const task of tasks) {

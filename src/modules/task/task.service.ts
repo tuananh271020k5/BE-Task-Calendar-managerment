@@ -1437,7 +1437,6 @@ export const taskService = {
               `Phiên làm việc ${i + 1} theo lịch AI`,
             status: "scheduled",
             priority: parentTask.priority,
-            deadline: parentTask.deadline,
             tags: [...(parentTask.tags || [])],
             userId: new Types.ObjectId(userId),
             parentTaskId: new Types.ObjectId(taskId),

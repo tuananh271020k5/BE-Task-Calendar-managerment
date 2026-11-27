@@ -91,6 +91,34 @@ export type AiProvider = {
   chatWithTools: (input: AiChatInput) => Promise<AiChatResult>;
 };
 
+const resolveOpenAiModel = (inputModel?: string): string => {
+  const candidate = (inputModel || "").trim();
+  const lower = candidate.toLowerCase();
+  if (
+    candidate &&
+    !lower.includes("gemini") &&
+    !lower.includes("llama") &&
+    !lower.includes("groq") &&
+    !lower.includes("openai/")
+  ) {
+    return candidate;
+  }
+  return (process.env.OPENAI_MODEL || "gpt-4o-mini").trim();
+};
+
+const resolveGroqModel = (inputModel?: string): string => {
+  const candidate = (inputModel || "").trim();
+  const lower = candidate.toLowerCase();
+  if (
+    candidate &&
+    !lower.includes("gpt-") &&
+    !lower.includes("gemini")
+  ) {
+    return candidate;
+  }
+  return (process.env.GROQ_MODEL || "llama-3.1-8b-instant").trim();
+};
+
 const groqChat = async (input: AiChatInput): Promise<AiChatResult> => {
   const apiKey = process.env.GROQ_API_KEY || "";
   if (!apiKey) throw new Error("GROQ_API_KEY_MISSING");
@@ -100,11 +128,7 @@ const groqChat = async (input: AiChatInput): Promise<AiChatResult> => {
     baseURL: process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1",
   });
 
-  const model = (
-    input.model ||
-    process.env.GROQ_MODEL ||
-    "llama-3.1-8b-instant"
-  ).trim();
+  const model = resolveGroqModel(input.model);
 
   try {
     const response = await client.chat.completions.create({
@@ -147,11 +171,7 @@ const groqChatStream = async function* (
     baseURL: process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1",
   });
 
-  const model = (
-    input.model ||
-    process.env.GROQ_MODEL ||
-    "llama-3.1-8b-instant"
-  ).trim();
+  const model = resolveGroqModel(input.model);
 
   try {
     const stream = await client.chat.completions.create({
@@ -180,51 +200,106 @@ const groqChatStream = async function* (
 
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
 
+const buildGeminiChatPayload = (input: AiChatInput) => {
+  let systemInstruction = "";
+  const rawTurns: { role: "user" | "model"; text: string }[] = [];
+
+  for (const m of input.messages) {
+    if (m.role === "system") {
+      if (m.content) systemInstruction += m.content + "\n";
+      continue;
+    }
+
+    const role: "user" | "model" = m.role === "assistant" ? "model" : "user";
+    let text =
+      m.role === "tool"
+        ? `[TOOL RESULT] ${m.content}`
+        : String(m.content ?? "");
+
+    if (!text.trim() && m.tool_calls?.length) {
+      text = `[TOOL CALL] ${m.tool_calls.map((t) => `${t.function.name}(${t.function.arguments})`).join(", ")}`;
+    }
+    if (!text.trim()) continue;
+
+    if (rawTurns.length > 0 && rawTurns[rawTurns.length - 1].role === role) {
+      rawTurns[rawTurns.length - 1].text += `\n${text}`;
+    } else {
+      rawTurns.push({ role, text });
+    }
+  }
+
+  // Gemini requires chat history to start with a "user" turn
+  while (rawTurns.length > 1 && rawTurns[0].role === "model") {
+    rawTurns.shift();
+  }
+
+  let history = rawTurns.slice(0, -1).map((t) => ({
+    role: t.role,
+    parts: [{ text: t.text }],
+  }));
+  let msg =
+    rawTurns.length > 0 ? rawTurns[rawTurns.length - 1].text : "";
+
+  if (rawTurns.length > 0 && rawTurns[rawTurns.length - 1].role === "model") {
+    history = rawTurns.map((t) => ({ role: t.role, parts: [{ text: t.text }] }));
+    msg = "Tiếp tục.";
+  }
+
+  const requestedModel = (input.model || "").trim();
+  const modelName = requestedModel.toLowerCase().includes("gemini")
+    ? requestedModel
+    : (process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL).trim();
+
+  return {
+    modelName,
+    systemInstruction: systemInstruction.trim(),
+    history,
+    msg,
+    generationConfig: {
+      ...(input.temperature !== undefined && {
+        temperature: input.temperature,
+      }),
+      // gemini-2.5-flash counts internal thinking tokens toward maxOutputTokens,
+      // so add headroom when callers pass small OpenAI-style maxTokens caps.
+      ...(input.maxTokens !== undefined && {
+        maxOutputTokens: Math.max(input.maxTokens + 512, 1024),
+      }),
+      ...(input.responseFormat === "json_object" && {
+        responseMimeType: "application/json",
+      }),
+    },
+  };
+};
+
 const geminiChat = async (input: AiChatInput): Promise<AiChatResult> => {
   const apiKey = process.env.GEMINI_API_KEY || "";
   if (!apiKey) throw new Error("GEMINI_API_KEY_MISSING");
 
   const genAI = new GoogleGenerativeAI(apiKey);
-  let systemInstruction = "";
-  const filteredMessages = input.messages.filter((m) => {
-    if (m.role === "system") {
-      systemInstruction += m.content + "\n";
-      return false;
-    }
-    return true;
-  });
+  const { modelName, systemInstruction, history, msg, generationConfig } =
+    buildGeminiChatPayload(input);
 
-  const modelName =
-    input.model || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
   const model = genAI.getGenerativeModel({
     model: modelName,
     ...(systemInstruction && { systemInstruction }),
-    generationConfig: {
-      ...(input.temperature !== undefined && {
-        temperature: input.temperature,
-      }),
-      ...(input.maxTokens !== undefined && {
-        maxOutputTokens: input.maxTokens,
-      }),
-    },
+    generationConfig,
   });
 
-  const history = filteredMessages.slice(0, -1).map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
-
-  const msg =
-    filteredMessages.length > 0
-      ? filteredMessages[filteredMessages.length - 1].content
-      : "";
   const chat = model.startChat({ history });
 
   try {
     const result = await chat.sendMessage(msg);
+    const meta = (result.response as any)?.usageMetadata;
     return {
       content: result.response.text(),
       model: modelName,
+      usage: meta
+        ? {
+            promptTokens: meta.promptTokenCount,
+            completionTokens: meta.candidatesTokenCount,
+            totalTokens: meta.totalTokenCount,
+          }
+        : undefined,
     };
   } catch (err: any) {
     const status = err?.status ?? err?.response?.status;
@@ -256,39 +331,15 @@ const geminiChatStream = async function* (
   if (!apiKey) throw new Error("GEMINI_API_KEY_MISSING");
 
   const genAI = new GoogleGenerativeAI(apiKey);
-  let systemInstruction = "";
-  const filteredMessages = input.messages.filter((m) => {
-    if (m.role === "system") {
-      systemInstruction += m.content + "\n";
-      return false;
-    }
-    return true;
-  });
+  const { modelName, systemInstruction, history, msg, generationConfig } =
+    buildGeminiChatPayload(input);
 
-  const modelName =
-    input.model || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
   const model = genAI.getGenerativeModel({
     model: modelName,
     ...(systemInstruction && { systemInstruction }),
-    generationConfig: {
-      ...(input.temperature !== undefined && {
-        temperature: input.temperature,
-      }),
-      ...(input.maxTokens !== undefined && {
-        maxOutputTokens: input.maxTokens,
-      }),
-    },
+    generationConfig,
   });
 
-  const history = filteredMessages.slice(0, -1).map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
-
-  const msg =
-    filteredMessages.length > 0
-      ? filteredMessages[filteredMessages.length - 1].content
-      : "";
   const chat = model.startChat({ history });
 
   try {
@@ -298,7 +349,21 @@ const geminiChatStream = async function* (
         yield { type: "delta", delta: chunk.text() };
       }
     }
-    yield { type: "done", model: modelName };
+    let usage: AiChatResult["usage"];
+    try {
+      const finalResp = await result.response;
+      const meta = (finalResp as any)?.usageMetadata;
+      if (meta) {
+        usage = {
+          promptTokens: meta.promptTokenCount,
+          completionTokens: meta.candidatesTokenCount,
+          totalTokens: meta.totalTokenCount,
+        };
+      }
+    } catch {
+      // Optional usage metadata
+    }
+    yield { type: "done", model: modelName, usage };
   } catch (err: any) {
     const status = err?.status ?? err?.response?.status;
     const errMsg = String(err?.message || "").toLowerCase();
@@ -329,11 +394,7 @@ const openaiChat = async (input: AiChatInput): Promise<AiChatResult> => {
   if (!apiKey) throw new Error("OPENAI_API_KEY_MISSING");
 
   const client = new OpenAI({ apiKey });
-  const model = (
-    input.model ||
-    process.env.OPENAI_MODEL ||
-    "gpt-4o-mini"
-  ).trim();
+  const model = resolveOpenAiModel(input.model);
 
   try {
     const response = await client.chat.completions.create({
@@ -372,11 +433,7 @@ const openaiChatStream = async function* (
   if (!apiKey) throw new Error("OPENAI_API_KEY_MISSING");
 
   const client = new OpenAI({ apiKey });
-  const model = (
-    input.model ||
-    process.env.OPENAI_MODEL ||
-    "gpt-4o-mini"
-  ).trim();
+  const model = resolveOpenAiModel(input.model);
 
   try {
     const stream = await client.chat.completions.create({
@@ -410,11 +467,7 @@ const openaiChatWithTools = async (
   if (!apiKey) throw new Error("OPENAI_API_KEY_MISSING");
 
   const client = new OpenAI({ apiKey });
-  const model = (
-    input.model ||
-    process.env.OPENAI_MODEL ||
-    "gpt-4o-mini"
-  ).trim();
+  const model = resolveOpenAiModel(input.model);
 
   try {
     const response = await client.chat.completions.create({
@@ -468,17 +521,19 @@ const openaiChatWithTools = async (
   }
 };
 
-type ProviderName = "openai" | "groq";
+type ProviderName = "openai" | "groq" | "gemini";
 
 const hasGroqKey = (): boolean => !!(process.env.GROQ_API_KEY || "").trim();
+const hasGeminiKey = (): boolean => !!(process.env.GEMINI_API_KEY || "").trim();
 
 /**
- * Provider order: prefer OpenAI (gpt-4o-mini), then Groq if configured.
+ * Provider order: prefer OpenAI (gpt-4o-mini), then Groq, then Gemini.
  */
 const resolveProviderOrder = (_purpose?: AiChatPurpose): ProviderName[] => {
   const order: ProviderName[] = [];
   if (hasOpenAiKey()) order.push("openai");
   if (hasGroqKey()) order.push("groq");
+  if (hasGeminiKey()) order.push("gemini");
   return order;
 };
 
@@ -487,7 +542,32 @@ const runChat = async (
   input: AiChatInput,
 ): Promise<AiChatResult> => {
   if (provider === "openai") return openaiChat(input);
-  return groqChat(input);
+  if (provider === "groq") return groqChat(input);
+  return geminiChat(input);
+};
+
+const runChatStream = async function* (
+  provider: ProviderName,
+  input: AiChatInput,
+): AsyncGenerator<AiChatStreamEvent> {
+  if (provider === "openai") {
+    yield* openaiChatStream(input);
+    return;
+  }
+  if (provider === "groq") {
+    yield* groqChatStream(input);
+    return;
+  }
+  yield* geminiChatStream(input);
+};
+
+const runChatWithTools = async (
+  provider: ProviderName,
+  input: AiChatInput,
+): Promise<AiChatResult> => {
+  if (provider === "openai") return openaiChatWithTools(input);
+  if (provider === "groq") return groqChatWithTools(input);
+  return geminiChat(input);
 };
 
 const isRetriableError = (err: any): boolean => {
@@ -506,7 +586,12 @@ const isRetriableError = (err: any): boolean => {
     lower.includes("rate limit") ||
     lower.includes("too many requests") ||
     lower.includes("permission_denied") ||
-    lower.includes("api key not valid")
+    lower.includes("api key not valid") ||
+    lower.includes("connection error") ||
+    lower.includes("fetch failed") ||
+    lower.includes("econnreset") ||
+    lower.includes("etimedout") ||
+    lower.includes("enotfound")
   )
     return true;
   const status = err?.status ?? err?.response?.status;
@@ -672,21 +757,42 @@ export const aiProvider: AiProvider = {
     throw lastErr ?? new Error("AI_PROVIDER_FAILED");
   },
   chatStream: async function* (input) {
-    if (hasOpenAiKey()) {
-      yield* openaiChatStream(input);
-    } else if (hasGroqKey()) {
-      yield* groqChatStream(input);
-    } else {
-      throw new Error("OPENAI_API_KEY_MISSING");
+    const order = resolveProviderOrder(input.purpose);
+    if (!order.length) throw new Error("OPENAI_API_KEY_MISSING");
+    let lastErr: any;
+    for (const p of order) {
+      let emittedAnyDelta = false;
+      try {
+        for await (const ev of runChatStream(p, input)) {
+          if (ev.type === "delta") emittedAnyDelta = true;
+          yield ev;
+        }
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (emittedAnyDelta || !isRetriableError(err)) throw err;
+        console.warn(
+          `[aiProvider] stream ${p} failed (${(err as any)?.message}).`,
+        );
+      }
     }
+    throw lastErr ?? new Error("AI_PROVIDER_FAILED");
   },
   chatWithTools: async (input) => {
-    if (hasOpenAiKey()) {
-      return openaiChatWithTools(input);
-    } else if (hasGroqKey()) {
-      return groqChatWithTools(input);
-    } else {
-      throw new Error("OPENAI_API_KEY_MISSING");
+    const order = resolveProviderOrder(input.purpose);
+    if (!order.length) throw new Error("OPENAI_API_KEY_MISSING");
+    let lastErr: any;
+    for (const p of order) {
+      try {
+        return await runChatWithTools(p, input);
+      } catch (err) {
+        lastErr = err;
+        if (!isRetriableError(err)) throw err;
+        console.warn(
+          `[aiProvider] chatWithTools ${p} failed (${(err as any)?.message}).`,
+        );
+      }
     }
+    throw lastErr ?? new Error("AI_PROVIDER_FAILED");
   },
 };
